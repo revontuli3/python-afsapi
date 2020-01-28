@@ -1,23 +1,52 @@
 """
 Implements an asynchronous interface for a Frontier Silicon device.
 
-For example internet radios from: Medion, Hama, Auna, ...
+For example internet radios from: Medion, Hama, Auna, Roberts, Revo...
+
+Rewritten to use native coroutines introduced in Python 3.5.
+Logic changed to avoid taking an exclusive connection to the device
+if not necessary, i.e. when only reading data.
+
+API methods:
+    'GET',
+    'SET',
+    'LIST_GET_NEXT',
+    'CREATE_SESSION',
+    'DELETE_SESSION',
+    'GET_NOTIFIES' # requires a session, not used here
+
+
+flammy's documentation was used to develop this:
+https://github.com/flammy/fsapi/blob/master/FSAPI.md
+
+TODO multiroom
+TODO presets netRemote.nav.presets
+TODO browse tab - netRemote.nav.list
+TODO improve error handling with proper exceptions based on status codes and status in return values
+TODO maybe use properties with setters and getters?
+TODO set position
+TODO netRemote.play.shuffle
+TODO netRemote.play.shuffleStatus - not sure where it should work, on our roberts it says 0
+netRemote.spotify.status - 2 playing, 3 paused, 0 not running
+TODO alarms
 """
+
+
 import asyncio
 import aiohttp
 import logging
-import traceback
+#import traceback
 
 from lxml import objectify
+from enum import Enum
 
 
-# pylint: disable=R0904
 class AFSAPI():
     """Builds the interface to a Frontier Silicon device."""
 
     DEFAULT_TIMEOUT_IN_SECONDS = 1
 
-    # states
+    # states TODO change to enum
     PLAY_STATES = {
         0: 'stopped',
         1: 'unknown',
@@ -25,8 +54,14 @@ class AFSAPI():
         3: 'paused',
     }
 
+    class Controls(Enum):
+        PLAY = 1
+        PAUSE = 2
+        NEXT = 3
+        PREVIOUS = 4
+
     # implemented API calls
-    API = {
+    API_CALLS = {
         # sys
         'friendly_name': 'netRemote.sys.info.friendlyName',
         'power': 'netRemote.sys.power',
@@ -42,19 +77,29 @@ class AFSAPI():
         'status': 'netRemote.play.status',
         'name': 'netRemote.play.info.name',
         'control': 'netRemote.play.control',
+        'position': 'netRemote.play.position',
         # info
         'text': 'netRemote.play.info.text',
         'artist': 'netRemote.play.info.artist',
         'album': 'netRemote.play.info.album',
         'graphic_uri': 'netRemote.play.info.graphicUri',
-        'duration': 'netRemote.play.info.duration',
+        'duration': 'netRemote.play.info.duration'
     }
 
-    def __init__(self, fsapi_device_url, pin, timeout=DEFAULT_TIMEOUT_IN_SECONDS):
-        """Initialize the Frontier Silicon device."""
+    def __init__(self, fsapi_device_url, pin, timeout=DEFAULT_TIMEOUT_IN_SECONDS, intrusive=False):
+        """
+        Initialize the connection to a Frontier Silicon device.
+        
+        :param str fsapi_device_url
+        :param str pin
+        :param str timeout
+        :param bool intrusive: Whether a new session should be created for read calls
+        """
+
         self.fsapi_device_url = fsapi_device_url
         self.pin = pin
         self.timeout = timeout
+        self.intrusive = intrusive
 
         self.sid = None
         self.__webfsapi = None
@@ -63,123 +108,131 @@ class AFSAPI():
         self.__equalisers = None
         self.__session = aiohttp.ClientSession()
 
-    def __del__(self):
-        """Destroy the device and http sessions."""
-        self.call('DELETE_SESSION')
-        if not self.__session.closed:
-            if self.__session._connector_owner:
-                self.__session._connector.close()
-            self.__session._connector = None
-        # session close fails on newer versions of aiohttp, replaced by the code above
-        # self.__session.close()
+    async def close(self):
+        """Close connection to the device and http sessions."""
+
+        if self.sid is not None:
+            await self.call('DELETE_SESSION', None, False)
+        await self.__session.close()
+
+    # async context manager
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *excinfo):
+        await self.close()
+
 
     # http request helpers
 
-    @asyncio.coroutine
-    def get_fsapi_endpoint(self):
+    async def get_fsapi_endpoint(self):
         """Parse the fsapi endpoint from the device url."""
-        endpoint = yield from self.__session.get(self.fsapi_device_url, timeout = self.timeout)
-        text = yield from endpoint.text(encoding='utf-8')
+        
+        endpoint = await self.__session.get(self.fsapi_device_url, timeout = self.timeout)
+        text = await endpoint.text(encoding='utf-8')
         doc = objectify.fromstring(text)
         return doc.webfsapi.text
 
-    @asyncio.coroutine
-    def create_session(self):
+    async def create_session(self):
         """Create a session on the frontier silicon device."""
+        
         req_url = '%s/%s' % (self.__webfsapi, 'CREATE_SESSION')
-        sid = yield from self.__session.get(req_url, params=dict(pin=self.pin),
+        sid = await self.__session.get(req_url, params={'pin': self.pin},
                                             timeout = self.timeout)
-        text = yield from sid.text(encoding='utf-8')
+        text = await sid.text(encoding='utf-8')
         doc = objectify.fromstring(text)
         return doc.sessionId.text
 
-    @asyncio.coroutine
-    def call(self, path, extra=None):
+    async def call(self, path, extra=None, create_session=True):
         """Execute a frontier silicon API call."""
+        
         try:
             if not self.__webfsapi:
-                self.__webfsapi = yield from self.get_fsapi_endpoint()
+                self.__webfsapi = await self.get_fsapi_endpoint()
 
-            if not self.sid:
-                self.sid = yield from self.create_session()
+            if create_session and not self.sid:
+                self.sid = await self.create_session()
 
             if not isinstance(extra, dict):
-                extra = dict()
+                extra = {}
 
-            params = dict(pin=self.pin, sid=self.sid)
+            params = {}
+            params['pin'] = self.pin
+            
+            if self.sid is not None:
+                params['sid'] = self.sid
+            
             params.update(**extra)
 
             req_url = ('%s/%s' % (self.__webfsapi, path))
-            result = yield from self.__session.get(req_url, params=params,
+            result = await self.__session.get(req_url, params=params,
                                                    timeout = self.timeout)
+
             if result.status == 200:
-                text = yield from result.text(encoding='utf-8')
-            else:
-                self.sid = yield from self.create_session()
-                params = dict(pin=self.pin, sid=self.sid)
+                text = await result.text(encoding='utf-8')
+            else: # TODO should happen only when the session is invalid, not for else
+                #TODO what does this actually do?
+                self.sid = await self.create_session()
+                params = {'pin': self.pin, 'sid': self.sid}
                 params.update(**extra)
-                result = yield from self.__session.get(req_url, params=params,
-                                                       timeout = self.timeout)
-                text = yield from result.text(encoding='utf-8')
+                result = await self.__session.get(req_url, params=params,
+                                                    timeout = self.timeout)
+                text = await result.text(encoding='utf-8')
 
             return objectify.fromstring(text)
-        except Exception as e:
-            logging.info('AFSAPI Exception: ' +traceback.format_exc())
+        except Exception as e: #TODO improve error handling
+            logging.info('AFSAPI Exception: ' +str(e))
 
         return None
 
     # Helper methods
 
     # Handlers
-    @asyncio.coroutine
-    def handle_get(self, item):
+    async def handle_get(self, item):
         """Helper method for reading a value by using the fsapi API."""
-        res = yield from self.call('GET/{}'.format(item))
+        res = await self.call(f'GET/{item}', None, False)
         return res
 
-    @asyncio.coroutine
-    def handle_set(self, item, value):
+    async def handle_set(self, item, value):
         """Helper method for setting a value by using the fsapi API."""
-        doc = yield from self.call('SET/{}'.format(item), dict(value=value))
+        doc = await self.call('SET/{}'.format(item), dict(value=value))
         if doc is None:
             return None
 
         return doc.status == 'FS_OK'
 
-    @asyncio.coroutine
-    def handle_text(self, item):
+    async def handle_text(self, item):
         """Helper method for fetching a text value."""
-        doc = yield from self.handle_get(item)
+        doc = await self.handle_get(item)
         if doc is None:
             return None
 
         return doc.value.c8_array.text or None
 
-    @asyncio.coroutine
-    def handle_int(self, item):
+    async def handle_int(self, item):
         """Helper method for fetching a integer value."""
-        doc = yield from self.handle_get(item)
+        doc = await self.handle_get(item)
         if doc is None:
             return None
 
         return int(doc.value.u8.text) or None
 
     # returns an int, assuming the value does not exceed 8 bits
-    @asyncio.coroutine
-    def handle_long(self, item):
+    async def handle_long(self, item):
         """Helper method for fetching a long value. Result is integer."""
-        doc = yield from self.handle_get(item)
+        doc = await self.handle_get(item)
         if doc is None:
             return None
 
         return int(doc.value.u32.text) or None
 
-    @asyncio.coroutine
-    def handle_list(self, item):
+    async def handle_list(self, item):
         """Helper method for fetching a list(map) value."""
-        doc = yield from self.call('LIST_GET_NEXT/'+item+'/-1', dict(
+        # TODO more than 100 items
+        doc = await self.call('LIST_GET_NEXT/'+item+'/-1', dict(
             maxItems=100,
-        ))
+        ), False)
 
         if doc is None:
             return []
@@ -187,17 +240,16 @@ class AFSAPI():
         if not doc.status == 'FS_OK':
             return []
 
-        ret = list()
+        ret = []
         for index, item in enumerate(list(doc.iterchildren('item'))):
-            temp = dict(band=index)
+            temp = {'band': index}
             for field in list(item.iterchildren()):
                 temp[field.get('name')] = list(field.iterchildren()).pop()
             ret.append(temp)
 
         return ret
 
-    @asyncio.coroutine
-    def collect_labels(self, items):
+    async def collect_labels(self, items):
         """Helper methods for extracting the labels from a list with maps."""
         if items is None:
             return []
@@ -207,190 +259,164 @@ class AFSAPI():
     # API implementation starts here
 
     # sys
-    @asyncio.coroutine
-    def get_friendly_name(self):
+    async def get_friendly_name(self):
         """Get the friendly name of the device."""
-        return (yield from self.handle_text(self.API.get('friendly_name')))
+        return (await self.handle_text(self.API_CALLS.get('friendly_name')))
 
-    @asyncio.coroutine
-    def set_friendly_name(self, value):
+    async def set_friendly_name(self, value):
         """Set the friendly name of the device."""
-        return (yield from self.handle_set(
-            self.API.get('friendly_name'), value))
+        return (await self.handle_set(
+            self.API_CALLS.get('friendly_name'), value))
 
-    @asyncio.coroutine
-    def get_power(self):
+    async def get_power(self):
         """Check if the device is on."""
-        power = (yield from self.handle_int(self.API.get('power')))
+        power = (await self.handle_int(self.API_CALLS.get('power')))
         return bool(power)
 
-    @asyncio.coroutine
-    def set_power(self, value=False):
+    async def set_power(self, value=False):
         """Power on or off the device."""
-        power = (yield from self.handle_set(
-            self.API.get('power'), int(value)))
+        power = (await self.handle_set(
+            self.API_CALLS.get('power'), int(value)))
         return bool(power)
 
-    @asyncio.coroutine
-    def get_modes(self):
+    async def get_modes(self):
         """Get the modes supported by this device."""
         if not self.__modes:
-            self.__modes = yield from self.handle_list(
-                self.API.get('valid_modes'))
+            self.__modes = await self.handle_list(
+                self.API_CALLS.get('valid_modes'))
 
         return self.__modes
 
-    @asyncio.coroutine
-    def get_mode_list(self):
+    async def get_mode_list(self):
         """Get the label list of the supported modes."""
-        self.__modes = yield from self.get_modes()
-        return (yield from self.collect_labels(self.__modes))
+        self.__modes = await self.get_modes()
+        return (await self.collect_labels(self.__modes))
 
-    @asyncio.coroutine
-    def get_mode(self):
+    async def get_mode(self):
         """Get the currently active mode on the device (DAB, FM, Spotify)."""
         mode = None
-        int_mode = (yield from self.handle_long(self.API.get('mode')))
-        modes = yield from self.get_modes()
+        int_mode = (await self.handle_long(self.API_CALLS.get('mode')))
+        modes = await self.get_modes()
         for temp_mode in modes:
             if temp_mode['band'] == int_mode:
                 mode = temp_mode['label']
 
         return str(mode)
 
-    @asyncio.coroutine
-    def set_mode(self, value):
+    async def set_mode(self, value):
         """Set the currently active mode on the device (DAB, FM, Spotify)."""
         mode = -1
-        modes = yield from self.get_modes()
+        modes = await self.get_modes()
         for temp_mode in modes:
             if temp_mode['label'] == value:
                 mode = temp_mode['band']
 
-        return (yield from self.handle_set(self.API.get('mode'), mode))
+        return (await self.handle_set(self.API_CALLS.get('mode'), mode))
 
-    @asyncio.coroutine
-    def get_volume_steps(self):
+    async def get_volume_steps(self):
         """Read the maximum volume level of the device."""
         if not self.__volume_steps:
-            self.__volume_steps = yield from self.handle_int(
-                self.API.get('volume_steps'))
+            self.__volume_steps = await self.handle_int(
+                self.API_CALLS.get('volume_steps'))
 
         return self.__volume_steps
 
     # Volume
-    @asyncio.coroutine
-    def get_volume(self):
+    async def get_volume(self):
         """Read the volume level of the device."""
-        return (yield from self.handle_int(self.API.get('volume')))
+        vol = (await self.handle_int(self.API_CALLS.get('volume')))
+        return 0 if vol is None else vol
 
-    @asyncio.coroutine
-    def set_volume(self, value):
+    async def set_volume(self, value):
         """Set the volume level of the device."""
-        return (yield from self.handle_set(self.API.get('volume'), value))
+        return (await self.handle_set(self.API_CALLS.get('volume'), value))
+        #TODO maybe do the same hack with 0
 
     # Mute
-    @asyncio.coroutine
-    def get_mute(self):
+    async def get_mute(self):
         """Check if the device is muted."""
-        mute = (yield from self.handle_int(self.API.get('mute')))
+        mute = (await self.handle_int(self.API_CALLS.get('mute')))
         return bool(mute)
 
-    @asyncio.coroutine
-    def set_mute(self, value=False):
+    async def set_mute(self, value=False):
         """Mute or unmute the device."""
-        mute = (yield from self.handle_set(self.API.get('mute'), int(value)))
+        mute = (await self.handle_set(self.API_CALLS.get('mute'), int(value)))
         return bool(mute)
 
-    @asyncio.coroutine
-    def get_play_status(self):
+    async def get_play_status(self):
         """Get the play status of the device."""
-        status = yield from self.handle_int(self.API.get('status'))
+        status = await self.handle_int(self.API_CALLS.get('status'))
         return self.PLAY_STATES.get(status)
 
-    @asyncio.coroutine
-    def get_play_name(self):
+    async def get_play_name(self):
         """Get the name of the played item."""
-        return (yield from self.handle_text(self.API.get('name')))
+        return (await self.handle_text(self.API_CALLS.get('name')))
 
-    @asyncio.coroutine
-    def get_play_text(self):
+    async def get_play_text(self):
         """Get the text associated with the played media."""
-        return (yield from self.handle_text(self.API.get('text')))
+        return (await self.handle_text(self.API_CALLS.get('text')))
 
-    @asyncio.coroutine
-    def get_play_artist(self):
+    async def get_play_artist(self):
         """Get the artists of the current media(song)."""
-        return (yield from self.handle_text(self.API.get('artist')))
+        return (await self.handle_text(self.API_CALLS.get('artist')))
 
-    @asyncio.coroutine
-    def get_play_album(self):
+    async def get_play_album(self):
         """Get the songs's album."""
-        return (yield from self.handle_text(self.API.get('album')))
+        return (await self.handle_text(self.API_CALLS.get('album')))
 
-    @asyncio.coroutine
-    def get_play_graphic(self):
+    async def get_play_graphic(self):
         """Get the album art associated with the song/album/artist."""
-        return (yield from self.handle_text(self.API.get('graphic_uri')))
+        return (await self.handle_text(self.API_CALLS.get('graphic_uri')))
 
-    @asyncio.coroutine
-    def get_play_duration(self):
+    async def get_play_duration(self):
         """Get the duration of the played media."""
-        return (yield from self.handle_long(self.API.get('duration')))
+        return (await self.handle_long(self.API_CALLS.get('duration')))
+
+    async def get_play_position(self):
+        """Get the position of the played media."""
+        return (await self.handle_long(self.API_CALLS.get('position')))
+
 
     # play controls
 
-    @asyncio.coroutine
-    def play_control(self, value):
-        """
-        Control the player of the device.
+    async def play_control(self, value):
+        """Control the player of the device."""
+        return (await self.handle_set(self.API_CALLS.get('control'), value))
 
-        1=Play; 2=Pause; 3=Next; 4=Previous (song/station)
-        """
-        return (yield from self.handle_set(self.API.get('control'), value))
-
-    @asyncio.coroutine
-    def play(self):
+    async def play(self):
         """Play media."""
-        return (yield from self.play_control(1))
+        return (await self.play_control(1))
 
-    @asyncio.coroutine
-    def pause(self):
+    async def pause(self):
         """Pause playing."""
-        return (yield from self.play_control(2))
+        return (await self.play_control(2))
 
-    @asyncio.coroutine
-    def forward(self):
+    async def forward(self):
         """Next media."""
-        return (yield from self.play_control(3))
+        return (await self.play_control(3))
 
-    @asyncio.coroutine
-    def rewind(self):
+    async def rewind(self):
         """Previous media."""
-        return (yield from self.play_control(4))
+        return (await self.play_control(4))
 
-    @asyncio.coroutine
-    def get_equalisers(self):
+    async def get_equalisers(self):
         """Get the equaliser modes supported by this device."""
         if not self.__equalisers:
-            self.__equalisers = yield from self.handle_list(
-                self.API.get('equalisers'))
+            self.__equalisers = await self.handle_list(
+                self.API_CALLS.get('equalisers'))
 
         return self.__equalisers
 
-    @asyncio.coroutine
-    def get_equaliser_list(self):
+    async def get_equaliser_list(self):
         """Get the label list of the supported modes."""
-        self.__equalisers = yield from self.get_equalisers()
-        return (yield from self.collect_labels(self.__equalisers))
+        self.__equalisers = await self.get_equalisers()
+        return (await self.collect_labels(self.__equalisers))
 
     # Sleep
-    @asyncio.coroutine
-    def get_sleep(self):
+    async def get_sleep(self):
         """Check when and if the device is going to sleep."""
-        return (yield from self.handle_long(self.API.get('sleep')))
+        return (await self.handle_long(self.API_CALLS.get('sleep')))
 
-    @asyncio.coroutine
-    def set_sleep(self, value=False):
+    async def set_sleep(self, value=False):
         """Set device sleep timer."""
-        return (yield from self.handle_set(self.API.get('sleep'), int(value)))
+        return (await self.handle_set(self.API_CALLS.get('sleep'), int(value)))
