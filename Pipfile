@@ -1,0 +1,16 @@
+[[source]]
+name = "pypi"
+url = "https://pypi.org/simple"
+verify_ssl = true
+
+[dev-packages]
+pylint = "*"
+rope = "*"
+
+[packages]
+afsapi = {editable = true,path = "."}
+aiohttp = ">=3.3.2"
+lxml = ">=3.6.0"
+
+[requires]
+python_version = "3.7"

@@ -7,44 +7,27 @@ Rewritten to use native coroutines introduced in Python 3.5.
 Logic changed to avoid taking an exclusive connection to the device
 if not necessary, i.e. when only reading data.
 
-API methods:
-    'GET',
-    'SET',
-    'LIST_GET_NEXT',
-    'CREATE_SESSION',
-    'DELETE_SESSION',
-    'GET_NOTIFIES' # requires a session, not used here
 
 
-flammy's documentation was used to develop this:
-https://github.com/flammy/fsapi/blob/master/FSAPI.md
 
 TODO multiroom
 TODO presets netRemote.nav.presets
 TODO browse tab - netRemote.nav.list
 TODO improve error handling with proper exceptions based on status codes and status in return values
-TODO maybe use properties with setters and getters?
 TODO set position
 TODO netRemote.play.shuffle
 TODO netRemote.play.shuffleStatus - not sure where it should work, on our roberts it says 0
-netRemote.spotify.status - 2 playing, 3 paused, 0 not running
 TODO alarms
 """
 
 
-import asyncio
-import aiohttp
 import logging
-#import traceback
 
 from lxml import objectify
 from enum import Enum
 
 
 class AFSAPI():
-    """Builds the interface to a Frontier Silicon device."""
-
-    DEFAULT_TIMEOUT_IN_SECONDS = 1
 
     # states TODO change to enum
     PLAY_STATES = {
@@ -85,107 +68,10 @@ class AFSAPI():
         'graphic_uri': 'netRemote.play.info.graphicUri',
         'duration': 'netRemote.play.info.duration'
     }
+    
+    
 
-    def __init__(self, fsapi_device_url, pin, timeout=DEFAULT_TIMEOUT_IN_SECONDS, intrusive=False):
-        """
-        Initialize the connection to a Frontier Silicon device.
-        
-        :param str fsapi_device_url
-        :param str pin
-        :param str timeout
-        :param bool intrusive: Whether a new session should be created for read calls
-        """
-
-        self.fsapi_device_url = fsapi_device_url
-        self.pin = pin
-        self.timeout = timeout
-        self.intrusive = intrusive
-
-        self.sid = None
-        self.__webfsapi = None
-        self.__modes = None
-        self.__volume_steps = None
-        self.__equalisers = None
-        self.__session = aiohttp.ClientSession()
-
-    async def close(self):
-        """Close connection to the device and http sessions."""
-
-        if self.sid is not None:
-            await self.call('DELETE_SESSION', None, False)
-        await self.__session.close()
-
-    # async context manager
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *excinfo):
-        await self.close()
-
-
-    # http request helpers
-
-    async def get_fsapi_endpoint(self):
-        """Parse the fsapi endpoint from the device url."""
-        
-        endpoint = await self.__session.get(self.fsapi_device_url, timeout = self.timeout)
-        text = await endpoint.text(encoding='utf-8')
-        doc = objectify.fromstring(text)
-        return doc.webfsapi.text
-
-    async def create_session(self):
-        """Create a session on the frontier silicon device."""
-        
-        req_url = '%s/%s' % (self.__webfsapi, 'CREATE_SESSION')
-        sid = await self.__session.get(req_url, params={'pin': self.pin},
-                                            timeout = self.timeout)
-        text = await sid.text(encoding='utf-8')
-        doc = objectify.fromstring(text)
-        return doc.sessionId.text
-
-    async def call(self, path, extra=None, create_session=True):
-        """Execute a frontier silicon API call."""
-        
-        try:
-            if not self.__webfsapi:
-                self.__webfsapi = await self.get_fsapi_endpoint()
-
-            if create_session and not self.sid:
-                self.sid = await self.create_session()
-
-            if not isinstance(extra, dict):
-                extra = {}
-
-            params = {}
-            params['pin'] = self.pin
-            
-            if self.sid is not None:
-                params['sid'] = self.sid
-            
-            params.update(**extra)
-
-            req_url = ('%s/%s' % (self.__webfsapi, path))
-            result = await self.__session.get(req_url, params=params,
-                                                   timeout = self.timeout)
-
-            if result.status == 200:
-                text = await result.text(encoding='utf-8')
-            else: # TODO should happen only when the session is invalid, not for else
-                #TODO what does this actually do?
-                self.sid = await self.create_session()
-                params = {'pin': self.pin, 'sid': self.sid}
-                params.update(**extra)
-                result = await self.__session.get(req_url, params=params,
-                                                    timeout = self.timeout)
-                text = await result.text(encoding='utf-8')
-
-            return objectify.fromstring(text)
-        except Exception as e: #TODO improve error handling
-            logging.info('AFSAPI Exception: ' +str(e))
-
-        return None
-
+    
     # Helper methods
 
     # Handlers
